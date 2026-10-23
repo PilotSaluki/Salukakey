@@ -14,10 +14,10 @@
     <string>SalukaKey</string>
 
     <key>CFBundleVersion</key>
-    <string>1.1.0</string>
+    <string>1.1.1</string>
 
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.1.1</string>
 
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
@@ -37,9 +37,10 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
 
-    <!-- Regular app: icon in the Dock, plus the menu-bar layout item. -->
+    <!-- Menu-bar-only app: no Dock icon. The bundle icon is still
+         used by Finder and by the About window. -->
     <key>LSUIElement</key>
-    <false/>
+    <true/>
 
     <!-- Minimum macOS version (Monterey+) -->
     <key>LSMinimumSystemVersion</key>

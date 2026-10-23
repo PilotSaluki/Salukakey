@@ -1538,9 +1538,8 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
         frontmostBundleID =
             NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
-        // 2. Build the status-bar item and the Dock app menu.
+        // 2. Build the status-bar item.
         setupStatusItem()
-        setupMainMenu()
 
         // 3. Install the CGEventTap.
         if !installEventTap() {
@@ -1599,13 +1598,6 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
     ) -> Bool {
         // The app lives in the menu bar even when About is closed.
         return false
-    }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication,
-                                       hasVisibleWindows flag: Bool) -> Bool {
-        // Clicking the Dock icon opens About when no window is visible.
-        if !flag { showAbout() }
-        return true
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1679,38 +1671,6 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
         autoSwitchItem?.isEnabled = !allFunctionsDisabled
         shiftSwitchItem?.isEnabled = true
         allFunctionsItem?.isEnabled = true
-    }
-
-    /// Standard application menu shown when the Dock icon is active.
-    private func setupMainMenu() {
-        let mainMenu = NSMenu()
-        let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
-
-        let appMenu = NSMenu(title: "SalukaKey")
-
-        let about = NSMenuItem(title: "About SalukaKey",
-                               action: #selector(showAbout),
-                               keyEquivalent: "")
-        about.target = self
-        appMenu.addItem(about)
-
-        appMenu.addItem(.separator())
-
-        let hide = NSMenuItem(title: "Hide SalukaKey",
-                              action: #selector(NSApplication.hide(_:)),
-                              keyEquivalent: "h")
-        hide.target = NSApp
-        appMenu.addItem(hide)
-
-        let quit = NSMenuItem(title: "Quit SalukaKey",
-                              action: #selector(NSApplication.terminate(_:)),
-                              keyEquivalent: "q")
-        quit.target = NSApp
-        appMenu.addItem(quit)
-
-        appMenuItem.submenu = appMenu
-        NSApp.mainMenu = mainMenu
     }
 
     @objc private func showAbout() {
@@ -3520,8 +3480,8 @@ private func eventTapCallbackFunc(
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 let app = NSApplication.shared
-// Regular app: icon in the Dock, plus the menu-bar layout indicator.
-app.setActivationPolicy(.regular)
+// Menu-bar-only app: no Dock icon, no application menu.
+app.setActivationPolicy(.accessory)
 
 let delegate = SalukaKeyApp()
 app.delegate = delegate
