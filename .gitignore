@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+._*
+
+# Xcode / Swift
+build/
+.build/
+DerivedData/
+.swiftpm/
+*.xcuserstate
+
+# App bundles and build output
+*.app
+*.app/
+*.dmg
+*.zip
+
+# Logs and temporary files
+*.log
+*.log.*
+*.bak
+*.swp
+*~
+
+# Python / editor caches
+__pycache__/
+.venv/
+.idea/
+.vscode/

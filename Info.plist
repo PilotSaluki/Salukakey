@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Bundle identity -->
+    <key>CFBundleIdentifier</key>
+    <string>com.pilot.SalukaKey</string>
+
+    <key>CFBundleName</key>
+    <string>SalukaKey</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>SalukaKey</string>
+
+    <key>CFBundleVersion</key>
+    <string>1.1.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.0</string>
+
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 SalukaKey</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleExecutable</key>
+    <string>SalukaKey</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <!-- Regular app: icon in the Dock, plus the menu-bar layout item. -->
+    <key>LSUIElement</key>
+    <false/>
+
+    <!-- Minimum macOS version (Monterey+) -->
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+
+    <!--
+      Privacy usage descriptions.
+      macOS shows these strings the first time the app triggers a
+      permission prompt (Input Monitoring, Accessibility).
+    -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>SalukaKey needs permission to interact with other applications for text transliteration.</string>
+
+</dict>
+</plist>
