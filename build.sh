@@ -53,7 +53,7 @@ fi
 # an empty identity) for macOS to keep Accessibility / Input Monitoring
 # permissions attached to the app instead of treating it as a new binary.
 if command -v codesign >/dev/null 2>&1; then
-    codesign --force --sign - "${BUNDLE_NAME}" >/dev/null 2>&1 || true
+    codesign --force --deep --sign - "${BUNDLE_NAME}" >/dev/null 2>&1 || true
 fi
 
 echo "✅ Build complete: ${BUNDLE_NAME}"

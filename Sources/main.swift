@@ -1444,10 +1444,32 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
     private var shiftSwitchItem: NSMenuItem?
     private var aboutWindowController: AboutWindowController?
     private var exclusionsWindowController: ExclusionsWindowController?
+    private var wordExceptionsWindowController:
+        WordExceptionsWindowController?
 
     // ── Exclusions ───────────────────────────────────────────
     private var frontmostBundleID: String?
     private var excludedBundleIDs: Set<String> = []
+
+    // ── Word exceptions ──────────────────────────────────────
+    /// Whole words that must never be auto-switched, and the only
+    /// allowed correction target when the same word is typed in the
+    /// wrong layout. Stored lowercased.
+    private var wordExceptions: Set<String> = []
+    /// Manual double-Shift corrections per "source→target" pair,
+    /// used to auto-learn a word after three identical corrections.
+    private var learnedCorrectionCounts: [String: Int] = [:]
+    /// Set right after an exception word was inserted at a boundary,
+    /// so the next double-Shift can put the original word back.
+    private var pendingExceptionUndo: ExceptionUndoRecord?
+
+    private struct ExceptionUndoRecord {
+        let original: String
+        let converted: String
+        let boundary: Character
+        let sourceID: String
+        let targetID: String
+    }
 
     // ── Event tap ────────────────────────────────────────────
     private var eventTap: CFMachPort?
@@ -1535,6 +1557,7 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
 
         // Load persisted exclusions before the event tap starts.
         loadExcludedApps()
+        loadWordExceptions()
         frontmostBundleID =
             NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
@@ -1642,6 +1665,13 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
         exclusionsItem.target = self
         menu.addItem(exclusionsItem)
 
+        let wordsItem = NSMenuItem(
+            title: "Слова-исключения...",
+            action: #selector(showWordExceptions),
+            keyEquivalent: "")
+        wordsItem.target = self
+        menu.addItem(wordsItem)
+
         let aboutItem = NSMenuItem(
             title: "About SalukaKey",
             action: #selector(showAbout),
@@ -1731,6 +1761,215 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
         let ids = UserDefaults.standard.stringArray(
             forKey: "ExcludedBundleIDs") ?? []
         excludedBundleIDs = Set(ids)
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // MARK: Word exceptions
+    // ══════════════════════════════════════════════════════════
+
+    @objc private func showWordExceptions() {
+        if wordExceptionsWindowController == nil {
+            let controller = WordExceptionsWindowController()
+            controller.onChange = { [weak self] in
+                self?.loadWordExceptions()
+                self?.pendingExceptionUndo = nil
+            }
+            wordExceptionsWindowController = controller
+        }
+        wordExceptionsWindowController?.refresh()
+        wordExceptionsWindowController?.showWindow(nil)
+        wordExceptionsWindowController?.window?.center()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Reload the persisted word list and the auto-learn counters.
+    private func loadWordExceptions() {
+        let stored = UserDefaults.standard.stringArray(
+            forKey: "WordExceptions") ?? []
+        wordExceptions = Set(stored.map { $0.lowercased() }
+            .filter { !$0.isEmpty })
+
+        if let counts = UserDefaults.standard.dictionary(
+            forKey: "WordExceptionLearning") {
+            learnedCorrectionCounts = counts.compactMapValues {
+                $0 as? Int
+            }
+        } else {
+            learnedCorrectionCounts = [:]
+        }
+    }
+
+    private func saveWordExceptions() {
+        UserDefaults.standard.set(wordExceptions.sorted(),
+                                  forKey: "WordExceptions")
+    }
+
+    private func persistLearningCounts() {
+        UserDefaults.standard.set(learnedCorrectionCounts,
+                                  forKey: "WordExceptionLearning")
+    }
+
+    /// Characters that separate a word from its neighbours: spaces,
+    /// newlines and punctuation. A word is trimmed of them before it
+    /// is stored in the learning counter or in the exception list,
+    /// so "fps " and "fps," both end up as "fps".
+    private static let wordSeparators: CharacterSet =
+        .whitespacesAndNewlines.union(.punctuationCharacters)
+
+    /// A clean, lowercased word without surrounding separators.
+    private static func cleanWord(_ text: String) -> String {
+        text.trimmingCharacters(in: wordSeparators).lowercased()
+    }
+
+    /// A word without its trailing separators. The leading edge is
+    /// kept on purpose: ",fps" is a different word than "fps".
+    private static func wordWithoutTail(_ text: String) -> String {
+        var tail = Substring(text)
+        while let last = tail.last,
+              last.isWhitespace || last.isPunctuation {
+            tail = tail.dropLast()
+        }
+        return String(tail).lowercased()
+    }
+
+    /// True when two strings describe the same token in two layouts.
+    ///
+    /// A punctuation key can be a letter in the other layout: in the
+    /// Russian layout "," is "б", so "t,frf" and "ебака" are the same
+    /// word in two layouts. A punctuation therefore has to face a
+    /// letter on the other side, and a punctuation that was kept as
+    /// punctuation in both words has to be the same character.
+    ///
+    /// A trailing separator is a boundary and not part of the word,
+    /// so "азы," and "азы" describe the same token.
+    private static func layoutsAgree(_ src: String,
+                                     _ dst: String) -> Bool {
+        let s = wordWithoutTail(src)
+        let d = wordWithoutTail(dst)
+        guard s.count == d.count else { return false }
+        for (a, b) in zip(s, d) {
+            if a.isLetter && b.isLetter { continue }
+            if a.isLetter != b.isLetter { continue }
+            if a == b { continue }
+            return false
+        }
+        return true
+    }
+
+    /// Learn a manual double-Shift correction. After three identical
+    /// corrections (`пшегиб` → `github`) the target becomes a word
+    /// exception, so it is corrected automatically from now on.
+    ///
+    /// The word is trimmed first, so a correction made after a
+    /// boundary (space, comma, dot) is learned under the same key as
+    /// the same correction made without it: "азы" and "азы," both
+    /// count towards "азы" → "fps".
+    ///
+    /// The dictionary is deliberately not consulted: three manual
+    /// double-Shifts are an explicit wish, even when the source word
+    /// is a proper word ("азы" → "fps").
+    ///
+    /// A token may contain a punctuation key that is a letter in the
+    /// other layout ("t,frf" → "ебака"). Such a token is learned as
+    /// well, and the exception word is the plain letter word of the
+    /// target.
+    private func recordManualCorrection(from source: String,
+                                        to target: String) {
+        let src = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dst = target.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Only a single word is learned, never a phrase.
+        guard !src.contains(where: { $0.isWhitespace }),
+              !dst.contains(where: { $0.isWhitespace }) else { return }
+
+        let srcLetters = src.filter { $0.isLetter }.lowercased()
+        let dstLetters = dst.filter { $0.isLetter }.lowercased()
+
+        guard srcLetters.count >= 2, dstLetters.count >= 2,
+              srcLetters != dstLetters,
+              Self.layoutsAgree(src, dst) else { return }
+
+        let srcWord = Self.cleanWord(src)
+        let dstWord = Self.wordWithoutTail(dst)
+
+        guard !wordExceptions.contains(srcWord),
+              !wordExceptions.contains(dstWord) else { return }
+
+        let key = "\(srcWord)→\(dstWord)"
+        let count = (learnedCorrectionCounts[key] ?? 0) + 1
+        learnedCorrectionCounts[key] = count
+        persistLearningCounts()
+
+        InputLogger.shared.log(
+            "WORD-LEARN \(key) count=\(count)")
+
+        guard count >= 3 else { return }
+
+        wordExceptions.insert(dstWord)
+        saveWordExceptions()
+        learnedCorrectionCounts.removeValue(forKey: key)
+        persistLearningCounts()
+        wordExceptionsWindowController?.refresh()
+        InputLogger.shared.log("WORD-LEARN added=\(dstWord)")
+    }
+
+    /// Whole-word exception match for a finished token: translate the
+    /// entire token into every other enabled layout and return the
+    /// first exact match. Substrings never match ("базы" → ",fps"),
+    /// only the complete converted word.
+    private func wordExceptionMatch(
+        strokes: [KeyStroke],
+        currentSourceID: String
+    ) -> (targetID: String, converted: String)? {
+        guard !wordExceptions.isEmpty else { return nil }
+
+        for source in inputManager.orderedSources() {
+            let otherID = source.id
+            guard otherID != currentSourceID else { continue }
+            let candidate = correctedToken(strokes, to: otherID)
+            guard !candidate.isEmpty else { continue }
+            if wordExceptions.contains(
+                Self.wordWithoutTail(candidate)) {
+                return (otherID, candidate)
+            }
+        }
+        return nil
+    }
+
+    /// Mid-word guard for the auto-switch heuristic.
+    ///
+    /// 1. The typed word already is an exception word — never touch it.
+    /// 2. The typed word is still growing into an exception word
+    ///    ("f", "fp", "fps") — let the user finish.
+    /// 3. The word translated to another layout is still growing into
+    ///    an exception word ("а" → "f", "аз" → "fp") — let the user
+    ///    finish, so the boundary can convert the whole word.
+    private func suppressAutoSwitchForWordExceptions(
+        _ strokes: [KeyStroke]
+    ) -> Bool {
+        guard !wordExceptions.isEmpty, !strokes.isEmpty else {
+            return false
+        }
+
+        let typed = String(strokes.map { $0.character }).lowercased()
+        if wordExceptions.contains(typed) { return true }
+        if wordExceptions.contains(where: { $0.hasPrefix(typed) }) {
+            return true
+        }
+
+        let currentID = inputManager.currentSourceID() ?? ""
+        for source in inputManager.orderedSources()
+            where source.id != currentID {
+            let candidate = Self.wordWithoutTail(
+                correctedToken(strokes, to: source.id))
+            guard !candidate.isEmpty else { continue }
+            if wordExceptions.contains(where: {
+                   $0.hasPrefix(candidate)
+               }) {
+                return true
+            }
+        }
+        return false
     }
 
     private func isExcludedFrontmostApp() -> Bool {
@@ -2241,6 +2480,15 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
             + " fallback=\(fallbackSourceID ?? "?")"
             + " selectionGesture=\(hadSelectionGesture ? 1 : 0)")
 
+        // ── 0. Undo a word-exception correction.
+        // The word just appeared in the document and the exception
+        // list put it there. An immediate double-Shift must restore
+        // the original word instead of transliterating it again.
+        if !hadSelectionGesture {
+            if restoreExceptionConversion() { return }
+        }
+        pendingExceptionUndo = nil
+
         // ── 1. Accessibility can read the selection.
         if let selectedText = selectedTextViaAX() {
             if !selectedText.isEmpty {
@@ -2268,6 +2516,52 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
 
         // ── 3. No selection: last typed token, no clipboard.
         continueWithToken(fallbackSourceID: fallbackSourceID)
+    }
+
+    /// Put the word back exactly as it was typed before the exception
+    /// list converted it. Only fires when the caret is still right
+    /// after the converted word and its boundary character.
+    private func restoreExceptionConversion() -> Bool {
+        guard let undo = pendingExceptionUndo else { return false }
+
+        let suffix = Array(undo.converted) + [undo.boundary]
+        guard typedRun.count >= suffix.count else {
+            pendingExceptionUndo = nil
+            return false
+        }
+        let tail = typedRun.suffix(suffix.count)
+        guard String(tail.map { $0.character }) == String(suffix) else {
+            pendingExceptionUndo = nil
+            return false
+        }
+
+        let restored = undo.original + String(undo.boundary)
+        KeySimulator.simulateBackspace(count: suffix.count)
+        inputManager.selectByID(undo.sourceID)
+        updateStatusTitle()
+        KeySimulator.typeUnicode(restored)
+
+        let replacement = restored.map {
+            TypedChar(character: $0,
+                      sourceID: undo.sourceID,
+                      keyCode: 0,
+                      shifted: false)
+        }
+        typedRun.removeLast(suffix.count)
+        typedRun.append(contentsOf: replacement)
+
+        lastSwitch = SwitchRecord(previousSourceID: undo.targetID,
+                                  newSourceID: undo.sourceID,
+                                  timestamp: Date())
+        pendingExceptionUndo = nil
+        selectionLikely = false
+        resetWordBuffer()
+
+        InputLogger.shared.log(
+            "WORD-EXCEPTION undo token="
+            + String(reflecting: restored))
+        endSimulation(after: 0.10)
+        return true
     }
 
     /// Copy the current selection with ⌘C, then convert it.
@@ -2335,6 +2629,8 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
             "DBL convert \(pair.src) -> \(pair.dst) "
             + "text=\(String(reflecting: text)) "
             + "converted=\(String(reflecting: converted))")
+
+        recordManualCorrection(from: text, to: converted)
 
         // Preferred path: direct Accessibility replacement. It never
         // touches NSPasteboard and can keep the text selected.
@@ -2426,6 +2722,10 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
             "DBL token-convert \(pair.src) -> \(pair.dst) "
             + "text=\(String(reflecting: token)) "
             + "converted=\(String(reflecting: converted))")
+
+        // Counts towards the auto-learn counter whether the word was
+        // finished with a boundary or not.
+        recordManualCorrection(from: token, to: converted)
 
         applyConvertedLayout(pair)
 
@@ -2740,6 +3040,11 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
             return false
         }
 
+        let strokes = wordPrefixStrokes + wordBuffer
+        if suppressAutoSwitchForWordExceptions(strokes) {
+            return false
+        }
+
         guard let decision = LanguageHeuristics.suggestedLayout(
             buffer: wordPrefixStrokes + wordBuffer,
             currentSourceID: curID,
@@ -2929,6 +3234,36 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
             return false
         }
 
+        // ── Word exceptions ─────────────────────────────────
+        // Rule 1: the finished word is exactly a protected word.
+        // Leave it as typed, even if the heuristics want to switch.
+        if wordExceptions.contains(expected.lowercased()) {
+            InputLogger.shared.log(
+                "WORD-EXCEPTION keep=" + String(reflecting: expected))
+            return false
+        }
+
+        // Rule 2: the whole word, translated to another layout, is
+        // a protected word. Only an exact whole-word match counts:
+        // "азы" → "fps", while "базы" → ",fps" does not match.
+        if let match = wordExceptionMatch(strokes: strokes,
+                                          currentSourceID: curID) {
+            InputLogger.shared.log(
+                "WORD-EXCEPTION convert="
+                + String(reflecting: expected)
+                + " -> " + String(reflecting: match.converted)
+                + " target=\(match.targetID)")
+            return replaceWordAtBoundary(
+                strokes: strokes,
+                boundary: boundary,
+                keyCode: keyCode,
+                shifted: shifted,
+                currentSourceID: curID,
+                targetID: match.targetID,
+                corrected: match.converted,
+                exceptionOriginal: expected)
+        }
+
         guard let decision = LanguageHeuristics.suggestedLayout(
             buffer: strokes,
             currentSourceID: curID,
@@ -2951,7 +3286,33 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
             + " corrected=\(String(reflecting: corrected))"
             + " boundary=\(String(reflecting: String(boundary)))")
 
-        lastSwitch = SwitchRecord(previousSourceID: curID,
+        return replaceWordAtBoundary(
+            strokes: strokes,
+            boundary: boundary,
+            keyCode: keyCode,
+            shifted: shifted,
+            currentSourceID: curID,
+            targetID: targetID,
+            corrected: corrected,
+            exceptionOriginal: nil)
+    }
+
+    /// Replace a finished token at a boundary. Used by the heuristic
+    /// and by the word-exception path, so both behave identically.
+    ///
+    /// When `exceptionOriginal` is set, the replacement is remembered
+    /// so an immediate double-Shift can restore the original word.
+    private func replaceWordAtBoundary(
+        strokes: [KeyStroke],
+        boundary: Character,
+        keyCode: UInt16,
+        shifted: Bool,
+        currentSourceID: String,
+        targetID: String,
+        corrected: String,
+        exceptionOriginal: String?
+    ) -> Bool {
+        lastSwitch = SwitchRecord(previousSourceID: currentSourceID,
                                   newSourceID: targetID,
                                   timestamp: Date())
 
@@ -2959,7 +3320,7 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
         updateStatusTitle()
         if !switched {
             InputLogger.shared.log(
-                "BOUNDARY-SWITCH-FAILED \(curID) -> \(targetID)")
+                "BOUNDARY-SWITCH-FAILED \(currentSourceID) -> \(targetID)")
         }
 
         // The boundary event is consumed, so the caret is still right
@@ -2984,6 +3345,17 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
                                   sourceID: targetID,
                                   keyCode: keyCode,
                                   shifted: shifted))
+
+        if let original = exceptionOriginal {
+            pendingExceptionUndo = ExceptionUndoRecord(
+                original: original,
+                converted: corrected,
+                boundary: boundary,
+                sourceID: currentSourceID,
+                targetID: targetID)
+        } else {
+            pendingExceptionUndo = nil
+        }
 
         InputLogger.shared.log(
             "BOUNDARY-RETYPE token="
@@ -3018,6 +3390,7 @@ final class SalukaKeyApp: NSObject, NSApplicationDelegate {
 
     private func clearTypedRun() {
         typedRun.removeAll()
+        pendingExceptionUndo = nil
     }
 
     /// The last contiguous non-whitespace run in `typedRun`.
@@ -3115,7 +3488,7 @@ final class AboutWindowController: NSWindowController {
         let shortVersion =
             Bundle.main.object(
                 forInfoDictionaryKey: "CFBundleShortVersionString"
-            ) as? String ?? "1.1.0"
+            ) as? String ?? "1.2.0"
         let version = NSTextField(labelWithString: "v\(shortVersion)")
         version.font = .systemFont(ofSize: 12)
         version.textColor = .secondaryLabelColor
@@ -3440,6 +3813,279 @@ final class ExclusionsWindowController: NSWindowController,
                 equalTo: cell.trailingAnchor, constant: -6),
             bundleID.topAnchor.constraint(
                 equalTo: name.bottomAnchor, constant: 1),
+        ])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        removeButton.isEnabled = table.selectedRow >= 0
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MARK: - Word Exceptions Window
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Standard macOS-style list of whole words that must never be
+/// auto-switched, and that are used as the correction target when the
+/// same word is typed in the wrong layout.
+final class WordExceptionsWindowController: NSWindowController,
+    NSTableViewDataSource, NSTableViewDelegate {
+
+    /// Called after the persisted list changes.
+    var onChange: (() -> Void)?
+
+    private let table = NSTableView()
+    private let scrollView = NSScrollView()
+    private let removeButton = NSButton()
+    private var words: [String] = []
+
+    private static let wordsKey = "WordExceptions"
+
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 390),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false)
+        window.title = "Слова-исключения"
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.backgroundColor = .windowBackgroundColor
+        super.init(window: window)
+        buildContent()
+        refresh()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    // ── UI ──────────────────────────────────────────────────
+
+    private func buildContent() {
+        guard let window = window,
+              let content = window.contentView else { return }
+
+        let title = NSTextField(labelWithString: "Слова-исключения")
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(title)
+
+        let subtitle = NSTextField(
+            wrappingLabelWithString:
+                "Эти слова не будут автопереключаться. Если слово набрано "
+                + "в другой раскладке, SalukaKey приведёт его к этому "
+                + "написанию — но только целое слово, не часть другого.")
+        subtitle.font = .systemFont(ofSize: 12)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.maximumNumberOfLines = 3
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(subtitle)
+
+        let column = NSTableColumn(
+            identifier: NSUserInterfaceItemIdentifier("word"))
+        column.title = "Слово"
+        column.width = 500
+        table.addTableColumn(column)
+        table.headerView = NSTableHeaderView()
+        table.delegate = self
+        table.dataSource = self
+        table.rowHeight = 28
+        table.usesAlternatingRowBackgroundColors = true
+        table.allowsMultipleSelection = false
+        table.allowsEmptySelection = true
+        table.translatesAutoresizingMaskIntoConstraints = false
+
+        scrollView.documentView = table
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(scrollView)
+
+        let addButton = NSButton(
+            title: "+",
+            target: self,
+            action: #selector(addWord))
+        addButton.bezelStyle = .texturedRounded
+        addButton.toolTip = "Добавить слово"
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(addButton)
+
+        removeButton.title = "−"
+        removeButton.target = self
+        removeButton.action = #selector(removeSelectedWord)
+        removeButton.bezelStyle = .texturedRounded
+        removeButton.toolTip = "Убрать выбранное слово"
+        removeButton.isEnabled = false
+        removeButton.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(removeButton)
+
+        let doneButton = NSButton(
+            title: "Готово",
+            target: self,
+            action: #selector(closeWindow))
+        doneButton.bezelStyle = .rounded
+        doneButton.keyEquivalent = "\r"
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(doneButton)
+
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor, constant: 20),
+            title.topAnchor.constraint(
+                equalTo: content.topAnchor, constant: 18),
+
+            subtitle.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor, constant: 20),
+            subtitle.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor, constant: -20),
+            subtitle.topAnchor.constraint(
+                equalTo: title.bottomAnchor, constant: 6),
+
+            scrollView.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor, constant: 20),
+            scrollView.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor, constant: -20),
+            scrollView.topAnchor.constraint(
+                equalTo: subtitle.bottomAnchor, constant: 14),
+            scrollView.heightAnchor.constraint(equalToConstant: 235),
+
+            addButton.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor, constant: 20),
+            addButton.topAnchor.constraint(
+                equalTo: scrollView.bottomAnchor, constant: 12),
+            addButton.widthAnchor.constraint(equalToConstant: 34),
+            addButton.heightAnchor.constraint(equalToConstant: 26),
+
+            removeButton.leadingAnchor.constraint(
+                equalTo: addButton.trailingAnchor, constant: 8),
+            removeButton.centerYAnchor.constraint(
+                equalTo: addButton.centerYAnchor),
+            removeButton.widthAnchor.constraint(equalToConstant: 34),
+            removeButton.heightAnchor.constraint(equalToConstant: 26),
+
+            doneButton.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor, constant: -20),
+            doneButton.centerYAnchor.constraint(
+                equalTo: addButton.centerYAnchor),
+        ])
+    }
+
+    // ── Data ────────────────────────────────────────────────
+
+    func refresh() {
+        let stored = UserDefaults.standard.stringArray(
+            forKey: Self.wordsKey) ?? []
+        words = Set(stored.map { $0.lowercased() })
+            .filter { !$0.isEmpty }
+            .sorted {
+                $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+            }
+        table.reloadData()
+        removeButton.isEnabled = false
+    }
+
+    private func save(_ newWords: Set<String>) {
+        UserDefaults.standard.set(newWords.sorted(),
+                                  forKey: Self.wordsKey)
+        refresh()
+        onChange?()
+    }
+
+    // ── Actions ─────────────────────────────────────────────
+
+    @objc private func addWord() {
+        guard let window = window else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Добавить слово"
+        alert.informativeText =
+            "Проверка срабатывает только на целое слово."
+        alert.addButton(withTitle: "Добавить")
+        alert.addButton(withTitle: "Отмена")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0,
+                                              width: 260, height: 24))
+        field.placeholderString = "например, github"
+        field.font = .systemFont(ofSize: 13)
+        field.translatesAutoresizingMaskIntoConstraints = false
+
+        let holder = NSView(frame: NSRect(x: 0, y: 0,
+                                          width: 260, height: 28))
+        holder.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: holder.leadingAnchor),
+            field.trailingAnchor.constraint(equalTo: holder.trailingAnchor),
+            field.centerYAnchor.constraint(equalTo: holder.centerYAnchor),
+            field.heightAnchor.constraint(equalToConstant: 24),
+        ])
+        alert.accessoryView = holder
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.insertWord(field.stringValue)
+        }
+        DispatchQueue.main.async {
+            alert.window.makeFirstResponder(field)
+        }
+    }
+
+    private func insertWord(_ raw: String) {
+        let word = raw.trimmingCharacters(
+            in: .whitespacesAndNewlines).lowercased()
+        guard !word.isEmpty else { return }
+        guard !word.contains(where: { $0.isWhitespace }) else {
+            NSSound.beep()
+            return
+        }
+        var stored = Set(UserDefaults.standard.stringArray(
+            forKey: Self.wordsKey) ?? [])
+        stored.insert(word)
+        save(stored)
+    }
+
+    @objc private func removeSelectedWord() {
+        let row = table.selectedRow
+        guard row >= 0, row < words.count else { return }
+        var stored = Set(UserDefaults.standard.stringArray(
+            forKey: Self.wordsKey) ?? [])
+        stored.remove(words[row])
+        save(stored)
+    }
+
+    @objc private func closeWindow() {
+        window?.close()
+    }
+
+    // ── Table ───────────────────────────────────────────────
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        words.count
+    }
+
+    func tableView(_ tableView: NSTableView,
+                   viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        guard row >= 0, row < words.count else { return nil }
+
+        let cell = NSTableCellView()
+        cell.identifier = NSUserInterfaceItemIdentifier("WordCell")
+
+        let label = NSTextField(labelWithString: words[row])
+        label.font = .systemFont(ofSize: 13)
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(label)
+        cell.textField = label
+
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(
+                equalTo: cell.leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(
+                equalTo: cell.trailingAnchor, constant: -8),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
     }
